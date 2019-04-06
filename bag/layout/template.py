@@ -464,8 +464,15 @@ class TemplateDB(MasterDB):
         sp_cols, sp_rows = via.sp_cols, via.sp_rows
         w_arr = num_cols * cw + (num_cols - 1) * sp_cols
         h_arr = num_rows * ch + (num_rows - 1) * sp_rows
+        
         x0 -= w_arr / 2
         y0 -= h_arr / 2
+        # If the via array is odd dimension, prevent off-grid points
+        if int(round(w_arr / self.grid.resolution)) % 2 == 1:
+            x0 -= 0.5 * self.grid.resolution
+        if int(round(h_arr / self.grid.resolution)) % 2 == 1:
+            y0 -= 0.5 * self.grid.resolution
+
         bl, br, bt, bb = via.enc1
         tl, tr, tt, tb = via.enc2
         bot_p0, bot_p1 = (x0 - bl, y0 - bb), (x0 + w_arr + br, y0 + h_arr + bt)
