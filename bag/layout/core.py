@@ -600,7 +600,7 @@ class TechInfo(object, metaclass=abc.ABCMeta):
         return [('square', 1), ('vrect', 2), ('hrect', 2)]
 
     def get_best_via_array(self, vname, bmtype, tmtype, bot_dir, top_dir, w, h, extend):
-        """Maximize the number of vias in the given area.
+        """Maximize the number of vias in the given bounding box.
 
         Parameters
         ----------
@@ -636,10 +636,13 @@ class TechInfo(object, metaclass=abc.ABCMeta):
         via_arr_dim : Tuple[int, int]
             the via array width/height, in resolution units.
         """
+        # This entire optimization routine relies on the bounding box being measured integer units
         res = self._resolution
         w = int(round(w / res))
         h = int(round(h / res))
 
+        # Depending on the routing direction of the metal, the provided width/height of the
+        # bounding box may correspond to either the x direction or y direction.
         if bot_dir == 'x':
             bb, be = h, w
         else:
@@ -649,6 +652,7 @@ class TechInfo(object, metaclass=abc.ABCMeta):
         else:
             tb, te = w, h
 
+        # Initialize variables that will hold optimal via size at the end of the algorithm
         best_num = None
         best_nxy = [-1, -1]
         best_mdim_list = None
@@ -656,51 +660,63 @@ class TechInfo(object, metaclass=abc.ABCMeta):
         best_vdim = None
         best_sp = None
         best_adim = None
+
+        # Perform via optimization algorithm for all available via types. Some technologies have
+        # both square and rectangular via types, which can be used in different situations. Each
+        # via_type has a weight which signifies a preference for choosing one type over another
         via_type_list = self.get_via_types(bmtype, tmtype)
         for vtype, weight in via_type_list:
+            # Extract via drc information from the loaded tech yaml file. Some drc info is optional
+            # so catch ValueErrors from missing info and move on
             try:
                 # get space and enclosure rules for top and bottom layer
                 bot_drc_info = self.get_via_drc_info(vname, vtype, bmtype, bb, True)
                 top_drc_info = self.get_via_drc_info(vname, vtype, tmtype, tb, False)
                 sp, sp2_list, sp3_list, dim, encb, arr_encb, arr_testb = bot_drc_info
                 _, _, _, _, enct, arr_enct, arr_testt = top_drc_info
-                # print _get_via_params(vname, vtype, bmtype, bw)
-                # print _get_via_params(vname, vtype, tmtype, tw)
             except ValueError:
                 continue
-
-            # compute maximum possible nx and ny
+            # optional sp2/sp3 rules enable different spacing rules for via arrays with 2 or 3 neighbors
             if sp2_list is None:
                 sp2_list = [sp]
             if sp3_list is None:
                 sp3_list = sp2_list
+
+            # Get minimum possible spacing between vias
             spx_min, spy_min = sp
             for high_sp_list in (sp2_list, sp3_list):
                 for high_spx, high_spy in high_sp_list:
                     spx_min = min(spx_min, high_spx)
                     spy_min = min(spy_min, high_spy)
 
+            # Get minimum possible enclosure size for top or bottom layers
             extx = 0
             exty = 0
             for enc in chain(encb, enct):
                 extx = min(extx, enc[0])
                 exty = min(exty, enc[1])
+
+            # Allocate area in the bounding box for minimum enclosure, then find
+            # maximum number of vias that can fit in the remaining area with the minimum spacing
             nx_max = (w + spx_min - 2 * extx) // (dim[0] + spx_min)
             ny_max = (h + spy_min - 2 * exty) // (dim[1] + spy_min)
 
-            # print nx_max, ny_max, dim, w, h, spx_min, spy_min
-
-            # generate list of possible nx/ny configuration
+            # Theoretically any combination of via array size from (1, 1) to (nx_max, ny_max) may actually
+            # work within the given bound box. Here we enumerate a list all of these possible via combinations
+            # starting from the max via number
             nxy_list = [(a * b, a, b) for a in range(1, nx_max + 1) for b in range(1, ny_max + 1)]
             nxy_list = sorted(nxy_list, reverse=True)
 
-            # find best nx/ny configuration
+            # Initialize variables that will hold the best working via array size for this via type
             opt_nxy = None
             opt_mdim_list = None
             opt_adim = None
             opt_sp = None
+
+            # This looping procedure will iterate over all possible via array configurations and select
+            # one that maximizes the number of vias while meeting all rules
             for num, nx, ny in nxy_list:
-                # check if we need to use sp3
+                # Determine whether we should be using sp/sp2/sp3 rules for the current via configuration
                 if nx == 2 and ny == 2:
                     sp_combo = sp2_list
                 elif nx > 1 and ny > 1:
@@ -708,19 +724,27 @@ class TechInfo(object, metaclass=abc.ABCMeta):
                 else:
                     sp_combo = [sp]
 
+                # DRC rules can typically be satisfied with a number of different spacing rules, so here we
+                # iterate over each to find the best one. Note that since we break out of the loop immediately upon
+                # finding a valid via configuration, this code prioritizes spacing rules that are early on in the list
                 for spx, spy in sp_combo:
-                    # get via array bounding box
+                    # Compute a bounding box for the via array without the enclosure
                     w_arr = dim[0] if nx == 1 else nx * (spx + dim[0]) - spx
                     h_arr = dim[1] if ny == 1 else ny * (spy + dim[1]) - spy
                     mdim_list = [None, None]
-                    # check at least one enclosure rule is satisfied for both top and bottom layer
+
+                    # Loop over all possible enclosure types and check whether this via configuration satisfies
+                    # one of them for both the bottom metal and top metal
                     for idx, (mdir, tot_enc_list, arr_enc, arr_test) in \
                             enumerate([(bot_dir, encb, arr_encb, arr_testb),
                                        (top_dir, enct, arr_enct, arr_testt)]):
-                        # check if array enclosure rule applies
+                        # arr_test is a function that takes an array size as input and returns a boolean. If its
+                        # is true the array size is valid and is added to the list of valid enclosures
                         if arr_test is not None and arr_test(ny, nx):
                             tot_enc_list = tot_enc_list + arr_enc
 
+                        # If the routing direction is y, start by computing x-direction enclosure. ext_dim
+                        # corresponds to x-direction. Vice-versa if the routing direction is x
                         if mdir == 'y':
                             enc_idx = 0
                             enc_dim = w_arr
@@ -734,24 +758,32 @@ class TechInfo(object, metaclass=abc.ABCMeta):
                             dim_lim = h
                             max_ext_dim = w
 
+                        # Initialize variable to hold opposite direction enclosure size
                         min_ext_dim = None
+
+                        # This loop selects the minimum opposite direction size that satisfies the enclosure
+                        # rules
                         for enc in tot_enc_list:
                             cur_ext_dim = ext_dim + 2 * enc[1 - enc_idx]
-                            if enc[enc_idx] * 2 + enc_dim <= dim_lim and \
-                                    (extend or cur_ext_dim <= max_ext_dim):
-                                # enclosure rule passed.  Find minimum other dimension
+                            # Check that the enclosure rule is satisfied. If extend is true, this passing enclosure
+                            # size can exceed the maximum size set by the user provided bounding box
+                            if (enc[enc_idx] * 2 + enc_dim <= dim_lim) and (extend or cur_ext_dim <= max_ext_dim):
+                                # Select the minimum of all enclosures in the non-routing direction that satisfies
+                                # the enclosure rules
                                 if min_ext_dim is None or min_ext_dim > cur_ext_dim:
                                     min_ext_dim = cur_ext_dim
 
+                        # If none of the enclosures in the list meet the rules, the current spacing rules cannot
+                        # be used to create a valid via, so we continue on to the next set of spacing rules
                         if min_ext_dim is None:
-                            # all enclosure rule failed.  Exit.
                             break
+                        # Otherwise record the computed via dimensions that pass all checks
                         else:
-                            # record metal dimension.
                             min_ext_dim = max(min_ext_dim, max_ext_dim)
                             mdim_list[idx] = [min_ext_dim, min_ext_dim]
                             mdim_list[idx][enc_idx] = dim_lim
 
+                    # If we've found a valid via configuration immediately break out of the loop
                     if mdim_list[0] is not None and mdim_list[1] is not None:
                         # passed
                         opt_mdim_list = mdim_list
@@ -760,9 +792,13 @@ class TechInfo(object, metaclass=abc.ABCMeta):
                         opt_sp = (spx, spy)
                         break
 
+                # If we've found a valid via array size immediately break out of the loop
                 if opt_nxy is not None:
                     break
 
+            # Select the best via out of all the passing via types. Vias are selected by choosing the
+            # highest 'best_num'. This is calculated by multiplying the via array size by the via weight
+            # Ties between vias are broken by minimizing drawn via area
             if opt_nxy is not None:
                 opt_num = weight * opt_nxy[0] * opt_nxy[1]
                 if (best_num is None or opt_num > best_num or
